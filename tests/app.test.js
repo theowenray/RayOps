@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+const noop = () => {};
+
+global.EventSource = class EventSourceMock {
+  addEventListener() {}
+  close() {}
+};
+
 global.document = {
   querySelector(selector) {
     if (selector === '#app') {
@@ -11,29 +18,41 @@ global.document = {
         }
       };
     }
-    return null;
+
+    return {
+      addEventListener: noop,
+      classList: { toggle: noop },
+      value: '',
+      reset: noop
+    };
   }
 };
 
+global.fetch = async () => ({
+  ok: true,
+  status: 200,
+  json: async () => ({ monitors: [], events: [], settings: { webhookUrlConfigured: false, webhookUrl: '' } })
+});
+
 const module = await import('../app.js');
-const { alertSummary, averageLatency, serviceHealthScore, state } = module;
-const { alerts, services } = await import('../data.js');
+const { formatTarget, summarizeMonitors } = module;
 
-test('averageLatency computes the rounded latency for filtered services', () => {
-  assert.equal(averageLatency(services.slice(0, 2)), 181);
+test('formatTarget shows host for ICMP monitor', () => {
+  assert.equal(formatTarget({ type: 'icmp', host: '192.168.1.10' }), '192.168.1.10');
 });
 
-test('alertSummary counts warning and critical alerts', () => {
-  assert.deepEqual(alertSummary(alerts), {
-    healthy: 0,
-    warning: 2,
-    critical: 1
-  });
+test('formatTarget shows host:port for TCP monitor', () => {
+  assert.equal(formatTarget({ type: 'port', host: '192.168.1.10', port: 22 }), '192.168.1.10:22');
 });
 
-test('serviceHealthScore responds to the current filter set', () => {
-  state.filter = 'critical';
-  const criticalServices = services.filter((service) => service.status === 'critical');
-  assert.equal(serviceHealthScore(criticalServices), 36);
-  state.filter = 'all';
+test('summarizeMonitors counts monitor statuses', () => {
+  assert.deepEqual(
+    summarizeMonitors([
+      { status: 'up' },
+      { status: 'up' },
+      { status: 'down' },
+      { status: 'unknown' }
+    ]),
+    { total: 4, up: 2, down: 1, unknown: 1 }
+  );
 });

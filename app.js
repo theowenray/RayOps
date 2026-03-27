@@ -1,241 +1,402 @@
-import { alerts, incidentTimeline, metricCards, services } from './data.js';
-
-const filterOptions = [
-  { label: 'All services', value: 'all' },
-  { label: 'Healthy', value: 'healthy' },
-  { label: 'Warning', value: 'warning' },
-  { label: 'Critical', value: 'critical' }
-];
-
-const healthScoreByStatus = {
-  healthy: 100,
-  warning: 72,
-  critical: 36
+const uiState = {
+  monitors: [],
+  events: [],
+  settings: {
+    webhookUrlConfigured: false
+  },
+  statusMessage: '',
+  statusType: 'info',
+  loading: true,
+  browserNotifyEnabled: false
 };
 
-const state = {
-  filter: 'all',
-  acknowledgedAlerts: new Set()
-};
+const previousMonitorStatus = new Map();
 
-function averageLatency(data) {
-  return Math.round(data.reduce((sum, service) => sum + service.latencyMs, 0) / data.length);
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
-function alertSummary(data) {
-  return data.reduce(
-    (summary, alert) => {
-      summary[alert.severity] += 1;
+function summarizeMonitors(monitors) {
+  return monitors.reduce(
+    (summary, monitor) => {
+      summary.total += 1;
+      summary[monitor.status] = (summary[monitor.status] || 0) + 1;
       return summary;
     },
-    { healthy: 0, warning: 0, critical: 0 }
+    { total: 0, up: 0, down: 0, unknown: 0 }
   );
 }
 
-function statusBadge(status) {
-  const label = status.charAt(0).toUpperCase() + status.slice(1);
-  return `<span class="status-badge ${status}">${label}</span>`;
+function formatTarget(monitor) {
+  if (monitor.type === 'port' || (monitor.type === undefined && monitor.port)) {
+    return `${monitor.host}:${monitor.port}`;
+  }
+  return monitor.host;
 }
 
-function getFilteredServices() {
-  if (state.filter === 'all') {
-    return services;
+function formatDateTime(isoDate) {
+  if (!isoDate) {
+    return 'Never';
   }
-
-  return services.filter((service) => service.status === state.filter);
+  return new Date(isoDate).toLocaleString();
 }
 
-function serviceHealthScore(filteredServices) {
-  if (!filteredServices.length) {
-    return 0;
+function formatMonitorType(type) {
+  return type === 'port' ? 'TCP port' : 'ICMP ping';
+}
+
+function formatOfflineWindow(ms) {
+  return `${Math.round(ms / 1000)}s`;
+}
+
+function notifyStatusChanges(monitors) {
+  if (!uiState.browserNotifyEnabled || typeof Notification === 'undefined') {
+    return;
+  }
+  if (Notification.permission !== 'granted') {
+    return;
   }
 
-  const total = filteredServices.reduce((sum, service) => sum + healthScoreByStatus[service.status], 0);
-  return Math.round(total / filteredServices.length);
+  for (const monitor of monitors) {
+    const previous = previousMonitorStatus.get(monitor.id);
+    if (!previous) {
+      previousMonitorStatus.set(monitor.id, monitor.status);
+      continue;
+    }
+
+    if (previous !== monitor.status && (monitor.status === 'down' || monitor.status === 'up')) {
+      const title = monitor.status === 'down' ? 'Monitor offline' : 'Monitor recovered';
+      const body = `${monitor.name} (${formatTarget(monitor)}) is now ${monitor.status.toUpperCase()}`;
+      new Notification(title, { body });
+    }
+
+    previousMonitorStatus.set(monitor.id, monitor.status);
+  }
+}
+
+function updateStatus(message, type = 'info') {
+  uiState.statusMessage = message;
+  uiState.statusType = type;
+}
+
+async function callApi(path, options = {}) {
+  const response = await fetch(path, {
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options
+  });
+  if (!response.ok) {
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = {};
+    }
+    const errorText =
+      payload?.error || (Array.isArray(payload?.errors) ? payload.errors.join(', ') : 'Request failed');
+    throw new Error(errorText);
+  }
+
+  if (response.status === 204) {
+    return null;
+  }
+  return response.json();
+}
+
+function monitorsMarkup(monitors) {
+  if (!monitors.length) {
+    return '<p class="empty">No monitors yet. Add your first host or port to start uptime checks.</p>';
+  }
+
+  return monitors
+    .map((monitor) => {
+      const statusClass = monitor.status || 'unknown';
+      const latencyText = monitor.lastLatencyMs === null ? '--' : `${monitor.lastLatencyMs} ms`;
+      const errorText = monitor.lastError ? `<p class="error-text">${escapeHtml(monitor.lastError)}</p>` : '';
+      return `
+        <article class="monitor-card">
+          <div class="monitor-head">
+            <div>
+              <h3>${escapeHtml(monitor.name)}</h3>
+              <p class="muted">${escapeHtml(formatTarget(monitor))} • ${formatMonitorType(monitor.type)}</p>
+            </div>
+            <span class="badge ${statusClass}">${statusClass.toUpperCase()}</span>
+          </div>
+          <dl class="meta-grid">
+            <div>
+              <dt>Latency</dt>
+              <dd>${latencyText}</dd>
+            </div>
+            <div>
+              <dt>Last checked</dt>
+              <dd>${escapeHtml(formatDateTime(monitor.lastCheckedAt))}</dd>
+            </div>
+            <div>
+              <dt>Interval</dt>
+              <dd>${Math.round(monitor.intervalMs / 1000)}s</dd>
+            </div>
+            <div>
+              <dt>Offline after</dt>
+              <dd>${formatOfflineWindow(monitor.offlineAfterMs)}</dd>
+            </div>
+          </dl>
+          ${errorText}
+          <div class="monitor-actions">
+            <button data-delete-monitor="${monitor.id}" class="ghost danger">Delete</button>
+          </div>
+        </article>
+      `;
+    })
+    .join('');
+}
+
+function eventsMarkup(events) {
+  if (!events.length) {
+    return '<p class="empty">No events yet.</p>';
+  }
+
+  return events
+    .slice(0, 40)
+    .map((event) => {
+      return `
+        <li class="event-item">
+          <div>
+            <span class="event-kind ${escapeHtml(event.kind)}">${escapeHtml(event.kind)}</span>
+            <strong>${escapeHtml(event.monitorName)}</strong>
+            <p>${escapeHtml(event.detail || `${event.monitorType} ${formatTarget(event)}`)}</p>
+          </div>
+          <time>${escapeHtml(formatDateTime(event.createdAt))}</time>
+        </li>
+      `;
+    })
+    .join('');
 }
 
 function render() {
   const app = document.querySelector('#app');
-  const filteredServices = getFilteredServices();
-  const summary = alertSummary(alerts);
-  const healthScore = serviceHealthScore(filteredServices);
-  const latency = filteredServices.length ? averageLatency(filteredServices) : 0;
+  const summary = summarizeMonitors(uiState.monitors);
+  const statusClass = uiState.statusType || 'info';
 
   app.innerHTML = `
-    <div class="app-shell">
-      <header class="hero">
+    <div class="shell">
+      <header class="top">
         <div>
-          <p class="eyebrow">Observability workspace</p>
+          <p class="kicker">Uptime monitoring</p>
           <h1>RayMonitor</h1>
-          <p class="hero-copy">
-            A focused control room for service health, active incidents, and recovery progress across the RayOps fleet.
-          </p>
+          <p class="subtle">Monitor machines and home ports from Lightsail with offline threshold alerts.</p>
         </div>
-        <div class="hero-panel">
-          <div>
-            <span>Fleet health score</span>
-            <strong>${healthScore}/100</strong>
-          </div>
-          <div>
-            <span>Filtered latency</span>
-            <strong>${latency} ms</strong>
-          </div>
-          <div>
-            <span>Acknowledged alerts</span>
-            <strong>${state.acknowledgedAlerts.size}</strong>
-          </div>
+        <div class="summary">
+          <div><span>Total</span><strong>${summary.total}</strong></div>
+          <div><span>Up</span><strong>${summary.up}</strong></div>
+          <div><span>Down</span><strong>${summary.down}</strong></div>
+          <div><span>Unknown</span><strong>${summary.unknown}</strong></div>
         </div>
       </header>
 
-      <section class="metric-grid" aria-label="Summary metrics">
-        ${metricCards
-          .map(
-            (card) => `
-              <article class="metric-card">
-                <span>${card.label}</span>
-                <strong>${card.value}</strong>
-                <p class="trend ${card.trend}">${card.delta}</p>
-              </article>
-            `
-          )
-          .join('')}
+      <section class="panel">
+        <h2>Add monitor</h2>
+        <form id="monitor-form" class="form-grid">
+          <label>Name<input required name="name" placeholder="Home NAS SSH" /></label>
+          <label>Host / IP<input required name="host" placeholder="203.0.113.10" /></label>
+          <label>
+            Check type
+            <select name="type" id="type-select">
+              <option value="icmp">Machine ping (ICMP)</option>
+              <option value="port">TCP port check</option>
+            </select>
+          </label>
+          <label id="port-label" class="hidden">Port<input name="port" type="number" min="1" max="65535" placeholder="22" /></label>
+          <label>Interval (seconds)<input name="intervalSeconds" type="number" min="3" value="15" /></label>
+          <label>Timeout (ms)<input name="timeoutMs" type="number" min="500" value="4000" /></label>
+          <label>Offline after (seconds)<input name="offlineAfterSeconds" type="number" min="3" value="30" /></label>
+          <button type="submit">Create monitor</button>
+        </form>
       </section>
 
-      <main class="dashboard-grid">
-        <section class="panel services-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Service inventory</p>
-              <h2>Live service health</h2>
-            </div>
-            <div class="filter-group" role="tablist" aria-label="Filter services by status">
-              ${filterOptions
-                .map(
-                  (option) => `
-                    <button class="filter-chip ${state.filter === option.value ? 'active' : ''}" data-filter="${option.value}">
-                      ${option.label}
-                    </button>
-                  `
-                )
-                .join('')}
-            </div>
-          </div>
+      <section class="panel settings">
+        <h2>Notifications</h2>
+        <form id="webhook-form" class="settings-row">
+          <input
+            type="url"
+            name="webhookUrl"
+            value="${uiState.settings.webhookUrl ? escapeHtml(uiState.settings.webhookUrl) : ''}"
+            placeholder="https://hooks.slack.com/services/..."
+            aria-label="Webhook URL"
+          />
+          <button type="submit">Save webhook</button>
+        </form>
+        <div class="settings-row">
+          <button id="browser-notify-button" class="ghost">${
+            uiState.browserNotifyEnabled ? 'Browser alerts enabled' : 'Enable browser alerts'
+          }</button>
+          <span class="muted">${
+            uiState.settings.webhookUrlConfigured
+              ? 'Webhook configured for offline/recovered events'
+              : 'No webhook configured'
+          }</span>
+        </div>
+      </section>
 
-          <div class="service-table" role="table" aria-label="Service table">
-            <div class="table-row table-head" role="row">
-              <span>Service</span>
-              <span>Owner</span>
-              <span>Region</span>
-              <span>Status</span>
-              <span>Latency</span>
-              <span>Error rate</span>
-            </div>
-            ${
-              filteredServices.length
-                ? filteredServices
-                    .map(
-                      (service) => `
-                        <div class="table-row" role="row">
-                          <strong>${service.name}</strong>
-                          <span>${service.owner}</span>
-                          <span>${service.region}</span>
-                          ${statusBadge(service.status)}
-                          <span>${service.latencyMs} ms</span>
-                          <span>${service.errorRate.toFixed(2)}%</span>
-                        </div>
-                      `
-                    )
-                    .join('')
-                : '<p class="empty-state">No services match the selected status.</p>'
-            }
-          </div>
+      ${
+        uiState.statusMessage
+          ? `<p class="notice ${statusClass}" role="status">${escapeHtml(uiState.statusMessage)}</p>`
+          : ''
+      }
+
+      <main class="layout">
+        <section class="panel">
+          <h2>Monitors</h2>
+          <div class="monitor-list">${uiState.loading ? '<p class="empty">Loading monitors...</p>' : monitorsMarkup(uiState.monitors)}</div>
         </section>
-
-        <aside class="sidebar-stack">
-          <section class="panel alert-panel">
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Incident queue</p>
-                <h2>Active alerts</h2>
-              </div>
-              <div class="alert-summary">
-                <span>${summary.critical} critical</span>
-                <span>${summary.warning} warning</span>
-              </div>
-            </div>
-            <div class="alert-list">
-              ${alerts
-                .map((alert) => {
-                  const acknowledged = state.acknowledgedAlerts.has(alert.id);
-                  return `
-                    <article class="alert-card ${acknowledged ? 'acknowledged' : ''}">
-                      <div class="alert-topline">
-                        ${statusBadge(alert.severity)}
-                        <span>${alert.startedAt}</span>
-                      </div>
-                      <h3>${alert.title}</h3>
-                      <p>${alert.detail}</p>
-                      <div class="alert-footer">
-                        <span>${alert.service}</span>
-                        <button data-alert-id="${alert.id}">
-                          ${acknowledged ? 'Undo acknowledgement' : 'Acknowledge'}
-                        </button>
-                      </div>
-                    </article>
-                  `;
-                })
-                .join('')}
-            </div>
-          </section>
-
-          <section class="panel timeline-panel">
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Runbook snapshot</p>
-                <h2>Recovery timeline</h2>
-              </div>
-            </div>
-            <ol class="timeline-list">
-              ${incidentTimeline
-                .map(
-                  (event) => `
-                    <li>
-                      <span>${event.time}</span>
-                      <div>
-                        <strong>${event.title}</strong>
-                        <p>${event.detail}</p>
-                      </div>
-                    </li>
-                  `
-                )
-                .join('')}
-            </ol>
-          </section>
+        <aside class="panel">
+          <h2>Event feed</h2>
+          <ul class="events">${eventsMarkup(uiState.events)}</ul>
         </aside>
       </main>
     </div>
   `;
 
-  app.querySelectorAll('[data-filter]').forEach((button) => {
-    button.addEventListener('click', () => {
-      state.filter = button.getAttribute('data-filter');
+  const typeSelect = document.querySelector('#type-select');
+  const portLabel = document.querySelector('#port-label');
+  typeSelect.addEventListener('change', () => {
+    portLabel.classList.toggle('hidden', typeSelect.value !== 'port');
+  });
+  portLabel.classList.toggle('hidden', typeSelect.value !== 'port');
+
+  document.querySelector('#monitor-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    const payload = {
+      name: formData.get('name'),
+      host: formData.get('host'),
+      type: formData.get('type'),
+      port: formData.get('port'),
+      intervalMs: Number(formData.get('intervalSeconds')) * 1000,
+      timeoutMs: Number(formData.get('timeoutMs')),
+      offlineAfterMs: Number(formData.get('offlineAfterSeconds')) * 1000
+    };
+
+    try {
+      await callApi('/api/monitors', { method: 'POST', body: JSON.stringify(payload) });
+      event.currentTarget.reset();
+      updateStatus('Monitor created.', 'success');
       render();
-    });
+      await syncState();
+    } catch (error) {
+      updateStatus(error.message || 'Could not create monitor.', 'error');
+      render();
+    }
   });
 
-  app.querySelectorAll('[data-alert-id]').forEach((button) => {
-    button.addEventListener('click', () => {
-      const alertId = button.getAttribute('data-alert-id');
-      if (state.acknowledgedAlerts.has(alertId)) {
-        state.acknowledgedAlerts.delete(alertId);
-      } else {
-        state.acknowledgedAlerts.add(alertId);
-      }
+  document.querySelector('#webhook-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    try {
+      await callApi('/api/settings/webhook', {
+        method: 'POST',
+        body: JSON.stringify({ webhookUrl: formData.get('webhookUrl') })
+      });
+      updateStatus('Webhook settings saved.', 'success');
       render();
+      await syncState();
+    } catch (error) {
+      updateStatus(error.message || 'Could not save webhook.', 'error');
+      render();
+    }
+  });
+
+  document.querySelector('#browser-notify-button').addEventListener('click', async () => {
+    if (typeof Notification === 'undefined') {
+      updateStatus('Browser notifications are not supported here.', 'error');
+      render();
+      return;
+    }
+
+    const permission = await Notification.requestPermission();
+    if (permission === 'granted') {
+      uiState.browserNotifyEnabled = true;
+      updateStatus('Browser notifications enabled.', 'success');
+    } else {
+      uiState.browserNotifyEnabled = false;
+      updateStatus('Browser notification permission denied.', 'error');
+    }
+    render();
+  });
+
+  app.querySelectorAll('[data-delete-monitor]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const id = button.getAttribute('data-delete-monitor');
+      try {
+        await callApi(`/api/monitors/${id}`, { method: 'DELETE' });
+        updateStatus('Monitor deleted.', 'success');
+        render();
+        await syncState();
+      } catch (error) {
+        updateStatus(error.message || 'Unable to delete monitor.', 'error');
+        render();
+      }
     });
   });
 }
 
-render();
+function applyStateFromServer(nextState) {
+  uiState.monitors = Array.isArray(nextState.monitors) ? nextState.monitors : [];
+  uiState.events = Array.isArray(nextState.events) ? nextState.events : [];
+  uiState.settings = nextState.settings || uiState.settings;
+  uiState.loading = false;
+  notifyStatusChanges(uiState.monitors);
+}
 
-export { alertSummary, averageLatency, getFilteredServices, healthScoreByStatus, serviceHealthScore, state };
+async function syncState() {
+  const payload = await callApi('/api/state');
+  applyStateFromServer(payload);
+}
+
+function connectEventStream() {
+  const stream = new EventSource('/api/stream');
+  stream.addEventListener('state', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      applyStateFromServer(payload);
+      render();
+    } catch {
+      updateStatus('Unable to parse stream update.', 'error');
+      render();
+    }
+  });
+  stream.addEventListener('error', () => {
+    updateStatus('Live stream disconnected, attempting reconnect...', 'error');
+    render();
+  });
+  return stream;
+}
+
+async function bootstrap() {
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return;
+  }
+
+  const mountPoint = document.querySelector('#app');
+  if (!mountPoint) {
+    return;
+  }
+
+  render();
+  try {
+    await syncState();
+    uiState.stream = connectEventStream();
+    render();
+  } catch (error) {
+    uiState.loading = false;
+    updateStatus(error.message || 'Failed to load dashboard data.', 'error');
+    render();
+  }
+}
+
+bootstrap();
+
+export { formatTarget, summarizeMonitors };
